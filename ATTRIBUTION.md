@@ -12,10 +12,6 @@ Licence: Apache-2.0, retained in `vendor/winit/LICENSE`.
 | `vendor/winit/examples/data/gradient.png` | winit contributors | https://github.com/rust-windowing/winit/blob/v0.30.13/examples/data/gradient.png | Apache-2.0 | Upstream source example/documentation |
 | `vendor/winit/examples/data/cross2.png` | winit contributors | https://github.com/rust-windowing/winit/blob/v0.30.13/examples/data/cross2.png | Apache-2.0 | Upstream source example/documentation |
 | `vendor/winit/examples/data/cross.png` | winit contributors | https://github.com/rust-windowing/winit/blob/v0.30.13/examples/data/cross.png | Apache-2.0 | Upstream source example/documentation |
-| `vendor/winit/docs/res/keyboard_standard_1_key.svg` | winit contributors | https://github.com/rust-windowing/winit/blob/v0.30.13/docs/res/keyboard_standard_1_key.svg | Apache-2.0 | Upstream source example/documentation |
-| `vendor/winit/docs/res/keyboard_right_shift_key.svg` | winit contributors | https://github.com/rust-windowing/winit/blob/v0.30.13/docs/res/keyboard_right_shift_key.svg | Apache-2.0 | Upstream source example/documentation |
-| `vendor/winit/docs/res/keyboard_numpad_1_key.svg` | winit contributors | https://github.com/rust-windowing/winit/blob/v0.30.13/docs/res/keyboard_numpad_1_key.svg | Apache-2.0 | Upstream source example/documentation |
-| `vendor/winit/docs/res/keyboard_left_shift_key.svg` | winit contributors | https://github.com/rust-windowing/winit/blob/v0.30.13/docs/res/keyboard_left_shift_key.svg | Apache-2.0 | Upstream source example/documentation |
 
 
 Every non-code asset in this repository (images, icons, fonts, example files, presets) is listed here with its author, source and licence. `cargo xtask assets` (part of `cargo xtask ci`) fails if an asset file is missing from this table.
