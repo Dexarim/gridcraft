@@ -1,9 +1,10 @@
 //! GridCraft desktop app.
 //!
-//! Usage: `gridcraft [--control <port>] [--sample <name>] [files…]`
+//! Usage: `gridcraft [--control <port> [--control-token <token>]] [--sample <name>] [files…]`
 //!
 //! `--control <port>` (or `GRIDCRAFT_CONTROL_PORT`) starts a localhost JSON-lines control
 //! server: `{"id":1,"method":"ui.inspect","params":{}}` → `{"id":1,"ok":true,"result":…}`.
+//! The first line of each connection must carry the token (`docs/control-protocol.md`).
 //! See `gridcraft_ui_egui::control` and `docs/control-protocol.md` for the methods.
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -22,42 +23,52 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gridcraft_engine::Session;
+use gridcraft_ui_egui::doc_windows::DocWindows;
 use gridcraft_ui_egui::{Services, SheetApp};
 use serde_json::json;
 
+/// The app, its native window per workbook window, and (macOS) the menu bar and Finder events.
 struct App(
     SheetApp,
-    #[cfg(target_os = "linux")] Option<craft_desktop::appmenu::Bridge>,
+    DocWindows,
     #[cfg(target_os = "macos")] Option<native_menu::NativeMenu>,
     #[cfg(target_os = "macos")] fmv_macos_events::Inbox,
+    #[cfg(target_os = "linux")] Option<craft_desktop::appmenu::Bridge>,
 );
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        #[cfg(target_os = "linux")]
-        if let Some(menu) = &mut self.1 {
-            for click in menu.take_events() {
-                gridcraft_ui_egui::desktop_menu::activate(&mut self.0, ctx, click.document, &click.action);
-            }
-        }
         #[cfg(target_os = "macos")]
         {
-            if self.1.is_none() && std::env::var_os("GRIDCRAFT_NO_NATIVE_MENU").is_none() {
-                self.1 = Some(native_menu::NativeMenu::install(ctx));
+            if self.2.is_none() && std::env::var_os("GRIDCRAFT_NO_NATIVE_MENU").is_none() {
+                self.2 = Some(native_menu::NativeMenu::install(ctx));
             }
-            if let Some(m) = &self.1 {
-                m.poll(&mut self.0, ctx);
+            if let Some(m) = &mut self.2 {
+                m.poll(&mut self.0, ctx, self.1.focused_viewport());
             }
-            apple_events::poll(&self.2, &mut self.0, ctx);
+            apple_events::poll(&self.3, &mut self.0, ctx);
         }
         self.0.logic(ctx);
-        self.0.poll_printing(ctx);
+        self.1.logic(&mut self.0, ctx);
+        #[cfg(target_os = "linux")]
+        if let Some(menu) = &mut self.2 {
+            for click in menu.take_events() {
+                // Only the root surface is bound. Never send a cached root-menu event to a
+                // child window, including a second view of the same workbook.
+                if self.1.root_menu_active(&self.0)
+                    && !ctx.input(|i| i.raw.viewports.iter().any(|(id, v)| *id != egui::ViewportId::ROOT && v.focused == Some(true)))
+                {
+                    gridcraft_ui_egui::desktop_menu::activate(&mut self.0, ctx, click.document, &click.action);
+                }
+            }
+        }
         if ctx.input(|input| input.viewport().close_requested()) && self.0.printing.busy() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
     }
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
-        self.0.raw_input_hook(raw);
+    /// Forwards raw input to the shared app, then opens every non-empty dropped file path as a workbook.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        self.0.raw_input_hook(ctx, raw);
         // Files dropped on the window open as workbooks.
         for f in std::mem::take(&mut raw.dropped_files) {
             if let Some(p) = f.path().to_str().map(str::to_string).filter(|p| !p.is_empty()) {
@@ -66,15 +77,17 @@ impl eframe::App for App {
         }
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.0.ui(ui);
+        self.1.show(&mut self.0, ui);
         #[cfg(target_os = "linux")]
-        if let Some(menu) = &self.1 {
-            menu.publish(gridcraft_ui_egui::desktop_menu::snapshot(&self.0));
+        if let Some(menu) = &self.2 {
+            let snapshot =
+                if self.1.root_menu_active(&self.0) { gridcraft_ui_egui::desktop_menu::snapshot(&self.0) } else { craft_desktop::Menu::default() };
+            menu.publish(snapshot);
         }
     }
     fn on_exit(&mut self) {
         #[cfg(target_os = "linux")]
-        self.1.take();
+        self.2.take();
         print::finish_pending_jobs();
         save_prefs(&self.0);
         // macOS (#117): end the process here, before eframe tears the window down. AccessKit's
@@ -128,7 +141,7 @@ fn load_prefs(app: &mut SheetApp) {
     {
         let saved = serde_json::from_slice(&b).ok().and_then(|v| gridcraft_ui_egui::i18n::saved_language(&v));
         let language = saved.unwrap_or(app.ui.language);
-        app.ui = ui;
+        app.ui = ui.at_startup();
         app.ui.language = language;
     }
     if let Ok(b) = std::fs::read(dir.join("prefs.json"))
@@ -197,11 +210,11 @@ fn services() -> Services {
         })),
         pick_save: Some(Box::new(|suggested: &str| {
             let path = std::path::Path::new(suggested);
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Book1").to_string();
+            let stem = path.file_stem().and_then(std::ffi::OsStr::to_str).unwrap_or("Book1").to_string();
             // The suggested name's type (an export asks for .pdf, .csv or .html) comes first.
             const TYPES: [(&str, &str); 4] =
                 [("Excel Workbook (.xlsx)", "xlsx"), ("CSV UTF-8 (.csv)", "csv"), ("Web Page (.html)", "html"), ("PDF (.pdf)", "pdf")];
-            let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).filter(|e| TYPES.iter().any(|(_, x)| x == e));
+            let ext = path.extension().and_then(std::ffi::OsStr::to_str).map(str::to_ascii_lowercase).filter(|e| TYPES.iter().any(|(_, x)| x == e));
             let ext = ext.unwrap_or_else(|| "xlsx".to_string());
             let mut dialog = rfd::FileDialog::new().set_file_name(format!("{stem}.{ext}"));
             for (label, x) in TYPES.iter().filter(|(_, x)| *x == ext).chain(TYPES.iter().filter(|(_, x)| *x != ext)) {
@@ -268,11 +281,20 @@ fn main() -> eframe::Result<()> {
         }
     }));
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The restart helper a self-update spawns: it finishes the swap and relaunches, then exits.
+    if let Some(done) = craft_update::self_update::finish(&craft_update::suite::GRIDCRAFT, &std::env::args_os().skip(1).collect::<Vec<_>>()) {
+        if let Err(e) = done {
+            eprintln!("GridCraft update helper failed: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("GridCraft {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     let mut control_port: Option<u16> = std::env::var("GRIDCRAFT_CONTROL_PORT").ok().and_then(|p| p.parse().ok());
+    let mut control_token: Option<String> = std::env::var("GRIDCRAFT_CONTROL_TOKEN").ok();
     let mut sample: Option<String> = None;
     let mut files: Vec<String> = Vec::new();
     let mut i = 0;
@@ -281,6 +303,10 @@ fn main() -> eframe::Result<()> {
             "--control" => {
                 i += 1;
                 control_port = args.get(i).and_then(|p| p.parse().ok());
+            }
+            "--control-token" => {
+                i += 1;
+                control_token = args.get(i).cloned();
             }
             "--sample" => {
                 i += 1;
@@ -315,6 +341,7 @@ fn main() -> eframe::Result<()> {
         session.new_workbook();
     }
     let mut app = SheetApp::new(session, services());
+    app.start_update_check();
     app.after_engine(); // Show warnings from the sample.
     let control_port = control_port;
     load_prefs(&mut app);
@@ -336,7 +363,20 @@ fn main() -> eframe::Result<()> {
     if let Some(i) = icon() {
         viewport = viewport.with_icon(i);
     }
+    let window_builder = viewport.clone();
     let options = eframe::NativeOptions { viewport, ..Default::default() };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut options = options;
+    // winit has no file drag-and-drop on Wayland (only on X11), so dropping files from the file
+    // manager showed a "no" cursor. Run through XWayland when it's there; GRIDCRAFT_WAYLAND=1
+    // keeps the native Wayland backend.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty()) && std::env::var_os("GRIDCRAFT_WAYLAND").is_none() {
+        options.event_loop_builder = Some(Box::new(|b| {
+            use winit::platform::x11::EventLoopBuilderExtX11;
+            b.with_x11();
+        }));
+    }
     // Before eframe creates the wgpu instance: Windows starts on DirectX 12, or OpenGL when
     // DirectX 12 has no GPU driver, and never touches Vulkan unless asked (see graphics.rs).
     #[cfg(target_os = "windows")]
@@ -369,11 +409,12 @@ fn main() -> eframe::Result<()> {
                 SheetApp::setup_context_for_language(&cc.egui_ctx, app.ui.dark, app.ui.language);
                 app.watch_desktop_theme(&cc.egui_ctx);
                 if let Some(port) = control_port {
-                    match control_server::start(port, cc.egui_ctx.clone()) {
+                    match control_server::start(port, control_token.clone(), cc.egui_ctx.clone()) {
                         Ok(rx) => app.control_rx = Some(rx),
                         Err(e) => log::error!("control channel on port {port}: {e}"),
                     }
                 }
+                let windows = DocWindows::new(&mut app, window_builder.clone(), DocWindows::platform_quits_with_last_window());
                 #[cfg(target_os = "linux")]
                 let menu = cc.winit_window().cloned().and_then(|window| {
                     let ctx = cc.egui_ctx.clone();
@@ -381,18 +422,19 @@ fn main() -> eframe::Result<()> {
                         window,
                         "ai.storyteller.gridcraft",
                         "GRIDCRAFT",
-                        gridcraft_ui_egui::desktop_menu::snapshot(&app),
+                        craft_desktop::Menu::default(),
                         move || ctx.request_repaint(),
                     )
                 });
                 Ok(Box::new(App(
                     app,
-                    #[cfg(target_os = "linux")]
-                    menu,
+                    windows,
                     #[cfg(target_os = "macos")]
                     None,
                     #[cfg(target_os = "macos")]
                     apple_events.connect(&cc.egui_ctx),
+                    #[cfg(target_os = "linux")]
+                    menu,
                 )))
             }),
         )

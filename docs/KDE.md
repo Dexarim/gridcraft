@@ -1,6 +1,6 @@
 # KDE Plasma / Linux desktop integration
 
-Updated 2026-10-21. Linux integration uses the portable menu model and optional desktop backends
+Updated 2026-10-29. Linux integration uses the portable menu model and optional desktop backends
 from the vendored `craft-desktop` snapshot. Its canonical development source is the parent
 workspace's `shared/craft-desktop`; independent application checkouts retain their own snapshot.
 The engine does not depend on D-Bus, Wayland, or KDE.
@@ -21,6 +21,10 @@ disable export. System appearance and the local ribbon continue to work independ
 Implementation is connected to the host; application-specific live Plasma verification is a
 separate check and is not implied by transport or menu-model tests.
 
+The existing launcher policy still prefers XWayland when available; `GRIDCRAFT_WAYLAND=1`
+selects native Wayland. The pinned winit fork includes native Wayland file-drop support,
+but that path has not been live-verified in this reconciliation.
+
 ## Appearance and local interface
 
 System appearance reads the standard XDG Settings portal's numeric
@@ -37,22 +41,40 @@ than exporting unusable engine calls. Rich galleries remain in the local ribbon.
 File dialogs already use rfd's XDG portal backend. Settings stay in the existing XDG config
 directory. No change to Plasma panels or user desktop configuration is required by the app.
 
-## Known pre-existing close-window risk
+## Multiple windows
 
-The native window close button and control `app.quit` do **not** run a multi-workbook unsaved
-changes workflow. The host only cancels a close while printing (`apps/gridcraft/src/main.rs`,
-`App::logic`); `crates/ui-egui/src/control.rs` forwards `app.quit` directly to the window.
-Save work before closing the window. File → Close (including Global Menu) does prompt for the
-active workbook, but that is not a guarantee for all workbooks when the entire window exits.
+The exporter currently binds only the original native window. Additional workbook windows,
+including another view of the same workbook, retain their local controls. While a child is
+active, the root menu is cleared and queued panel actions are rejected. Delayed clipboard
+events also retain their originating window identity. Per-window Global Menu binding remains
+pending; this migration does not claim full multiwindow Plasma acceptance.
 
-This is an existing application limitation, not a new Global Menu action. The engine's
-`file.close` in `crates/engine/src/cmd/file.rs` handles only the active document, and the
-`saveChanges` dialog in `crates/ui-egui/src/dialogs.rs` stores only its title. Safely reusing it
-for window quit needs an explicit document-ID-based queue with Save As cancellation, failed
-saves, editor drafts and background document changes handled; a one-line active-document close
-would leave other dirty workbooks unprotected. This work does not introduce that state machine.
+Editor clipboard requests can finish asynchronously. Their document, window, selection and
+editor target are rechecked until delivery; returning to a changed target does not revive an
+old request. Only one request of each kind may be outstanding. Toolkit clipboard events carry
+no request ID, so an overlapping keyboard paste can be conservatively rejected while a stale
+menu request is pending; retry after that event resolves. A duplicate menu request displays a
+notification. If the native clipboard returns no event, click back in the document before
+retrying to cancel the outstanding request. No guessed frame or timeout expiry
+allows an old paste into a new target. These paths still require native clipboard acceptance.
+
+Upstream's document-window close and quit workflow, including its unsaved-workbook prompts,
+is retained. The earlier single-window close-risk description no longer describes this host.
 
 ## Verification
+
+Current reconciliation (2026-10-29): exact `cargo xtask ci` passed all ten stages
+(i18n report, formatting, workspace Clippy, tests, doctests, assets, layers, WASM,
+parity and keytips), using the pinned required craft-fonts checkout. The focused
+clipboard/menu regressions (7) and same-document child-window regression (1) also passed.
+
+A fresh isolated native Wayland smoke test passed: the exported Collapse Ribbon action
+changed `ui.ribbonCollapsed` from false to true, updated its checked state, and the resulting
+window screenshot was inspected. The real `plasmashell` process requested `GetLayout`.
+This checks one root-window action and transport; clipboard races, child-window export,
+file drops, mixed DPI and portal interactions still require their own live acceptance.
+Evidence: workspace artifact `native-smoke-gridcraft-ja5m4lvq`; CI log
+`/tmp/gridcraft-kde-full-ci.log`. The dated results below describe the earlier implementation.
 
 ```sh
 CARGO_BUILD_JOBS=2 cargo test -p gridcraft -p gridcraft-ui-egui --lib --bins desktop_menu

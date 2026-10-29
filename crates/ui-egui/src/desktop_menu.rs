@@ -6,39 +6,129 @@ use serde_json::{Value, json};
 
 use crate::SheetApp;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum ClipboardKind {
     Copy,
     Cut,
     Paste,
 }
 
+#[derive(PartialEq)]
+struct ClipboardTarget {
+    document: u64,
+    window: Option<u64>,
+    viewport: egui::ViewportId,
+    focused: Option<egui::Id>,
+    cursor: Option<egui::text::CCursorRange>,
+    selection: Option<(usize, gridcraft_engine::Selection)>,
+    editor: Option<(String, usize, usize)>,
+    text_box: Option<(u32, String)>,
+}
+
+impl ClipboardTarget {
+    fn capture(app: &SheetApp, ctx: &egui::Context) -> Self {
+        let focused = ctx.memory(|m| m.focused());
+        Self {
+            document: document(app),
+            window: app.session.active_window(),
+            viewport: ctx.viewport_id(),
+            focused,
+            cursor: focused.and_then(|id| egui::text_edit::TextEditState::load(ctx, id)).and_then(|s| s.cursor.char_range()),
+            selection: app.session.active().map(|d| (d.wb.active_sheet(), d.selection.clone())),
+            editor: app.editor.as_ref().map(|e| (e.text.clone(), e.caret, e.anchor)),
+            text_box: app.text_box_editor.as_ref().map(|e| (e.id, e.text.clone())),
+        }
+    }
+}
+
 pub(crate) struct ClipboardRequest {
     frame: u64,
-    document: u64,
+    target: ClipboardTarget,
+    rejected: bool,
     kind: ClipboardKind,
 }
 
-/// Revalidate delayed toolkit events before cell/formula/text-box editors can consume them.
-pub(crate) fn guard_clipboard(app: &mut SheetApp, ctx: &egui::Context) {
-    let current = document(app);
-    let modal = blocked(app);
-    for request in &app.desktop_clipboard {
-        if current != request.document || modal {
-            ctx.input_mut(|input| {
-                input.events.retain(|event| {
-                    !matches!(
-                        (request.kind, event),
-                        (ClipboardKind::Copy, egui::Event::Copy)
-                            | (ClipboardKind::Cut, egui::Event::Cut)
-                            | (ClipboardKind::Paste, egui::Event::Paste(_))
-                    )
-                });
-            });
-        }
+impl ClipboardKind {
+    fn matches(self, event: &egui::Event) -> bool {
+        matches!(
+            (self, event),
+            (Self::Copy, egui::Event::Copy) | (Self::Cut, egui::Event::Cut) | (Self::Paste, egui::Event::Paste(_) | egui::Event::PasteImage(_))
+        )
     }
-    // Request* is processed after this frame's UI and delivered on the next frame.
-    app.desktop_clipboard.retain(|request| ctx.cumulative_frame_nr() <= request.frame);
+}
+
+/// Called before control-channel events are injected. Only native cancellation can retire a
+/// request without a matching response: synthetic edits never cancel the toolkit transfer.
+pub(crate) fn guard_native_clipboard(app: &mut SheetApp, raw: &mut egui::RawInput) {
+    // eframe can carry an unconsumed synthetic batch across logic-only ticks. Its origin is
+    // ambiguous here, so leave retirement to delivery while that batch remains pending.
+    if app.synthetic_pending {
+        return;
+    }
+    let cancelled = raw.events.iter().any(|event| {
+        matches!(
+            event,
+            egui::Event::Key { pressed: true, .. }
+                | egui::Event::PointerButton { pressed: true, .. }
+                | egui::Event::Ime(egui::ImeEvent::Commit(_))
+                | egui::Event::WindowFocused(_)
+        )
+    });
+    if !cancelled {
+        return;
+    }
+    app.desktop_clipboard.retain(|request| {
+        if request.target.viewport != raw.viewport_id {
+            return true;
+        }
+        // Never admit an already queued response from the same cancellation batch.
+        raw.events.retain(|event| !request.kind.matches(event));
+        false
+    });
+}
+
+/// Revalidate delayed toolkit events before cell/formula/text-box editors can consume them.
+/// A changed app target remains rejected even if the user returns before delivery. Events have
+/// no request token: while a rejected request is pending, matching deliveries fail closed.
+pub(crate) fn guard_clipboard(app: &mut SheetApp, ctx: &egui::Context) {
+    if ctx.viewport_id() != egui::ViewportId::ROOT {
+        return;
+    }
+    let current = ClipboardTarget::capture(app, ctx);
+    let modal = blocked(app);
+    let frame = ctx.cumulative_frame_nr();
+    let new_input = ctx.input(|i| {
+        i.events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::Key { pressed: true, .. }
+                    | egui::Event::PointerButton { pressed: true, .. }
+                    | egui::Event::Text(_)
+                    | egui::Event::Ime(_)
+                    | egui::Event::WindowFocused(_)
+                    | egui::Event::MouseWheel { .. }
+            )
+        })
+    });
+    app.desktop_clipboard.retain_mut(|request| {
+        // A key/pointer edit can change the target later in this same UI pass. A matching
+        // completion in that batch is ambiguous even if the model still matches right now.
+        request.rejected |= current != request.target || modal || (frame > request.frame && new_input);
+        let mut delivered = false;
+        ctx.input_mut(|input| {
+            input.events.retain(|event| {
+                if request.kind.matches(event) {
+                    delivered = true;
+                    !request.rejected
+                } else {
+                    true
+                }
+            })
+        });
+        // No frame/timeout expiry or cancellation inferred from synthetic UI input.
+        // A completed event can be waiting while the UI is stalled.
+        !delivered
+    });
 }
 
 fn document(app: &SheetApp) -> u64 {
@@ -248,7 +338,19 @@ pub fn activate(app: &mut SheetApp, ctx: &egui::Context, doc: u64, action: &Acti
             "edit.cut" => (ClipboardKind::Cut, egui::ViewportCommand::RequestCut),
             _ => (ClipboardKind::Paste, egui::ViewportCommand::RequestPaste),
         };
-        app.desktop_clipboard.push(ClipboardRequest { frame: ctx.cumulative_frame_nr(), document: doc, kind });
+        // Events carry no request ID. Do not overlap requests of the same kind: their
+        // completions could arrive out of order. At most three target snapshots are retained.
+        if app.desktop_clipboard.iter().any(|request| request.kind == kind) {
+            app.toast = Some(("Clipboard request is still pending. Click in the document, then try again.".into(), crate::now_ms()));
+            ctx.request_repaint();
+            return;
+        }
+        app.desktop_clipboard.push(ClipboardRequest {
+            frame: ctx.cumulative_frame_nr(),
+            target: ClipboardTarget::capture(app, ctx),
+            rejected: false,
+            kind,
+        });
         ctx.send_viewport_cmd(command);
         ctx.request_repaint();
         return;
@@ -332,6 +434,7 @@ mod tests {
             let mut h = egui_kittest::Harness::builder().build_ui_state(
                 |ui, (app, received): &mut (SheetApp, Vec<egui::Event>)| {
                     app.logic(ui.ctx());
+                    guard_clipboard(app, ui.ctx());
                     received.extend(ui.input(|i| {
                         i.events
                             .iter()
@@ -348,6 +451,9 @@ mod tests {
             let doc = document(&h.state().0);
             activate(&mut h.state_mut().0, &ctx, doc, &Action { command: command.into(), params: json!({}) });
             assert_eq!(h.state().0.desktop_clipboard.len(), 1);
+            // Wayland can complete several repaints after RequestPaste was emitted.
+            h.run_steps(6);
+            assert_eq!(h.state().0.desktop_clipboard.len(), 1);
             h.state_mut().0.run("file.new", json!({})).unwrap();
             h.event(event.clone());
             h.run_steps(3);
@@ -355,6 +461,112 @@ mod tests {
             h.event(event);
             h.run_steps(2);
             assert_eq!(h.state().1.len(), 1, "ordinary keyboard {command} remains available");
+        }
+    }
+
+    #[test]
+    fn desktop_menu_delayed_paste_checks_selection_history_and_image_events() {
+        for (change, image) in [(0, false), (1, false), (1, true), (2, false), (3, false), (4, false), (5, false)] {
+            let mut h = egui_kittest::Harness::builder().build_ui_state(
+                |ui, (app, received): &mut (SheetApp, Vec<egui::Event>)| {
+                    app.logic(ui.ctx());
+                    guard_clipboard(app, ui.ctx());
+                    received.extend(ui.input(|i| {
+                        i.events.iter().filter(|e| matches!(e, egui::Event::Paste(_) | egui::Event::PasteImage(_))).cloned().collect::<Vec<_>>()
+                    }));
+                },
+                (app(), Vec::new()),
+            );
+            h.run_steps(2);
+            h.state_mut().0.begin_edit(Some("draft".into()), false);
+            let ctx = h.ctx.clone();
+            let doc = document(&h.state().0);
+            let action = Action { command: "edit.paste".into(), params: json!({}) };
+            activate(&mut h.state_mut().0, &ctx, doc, &action);
+            activate(&mut h.state_mut().0, &ctx, doc, &action);
+            assert_eq!(h.state().0.desktop_clipboard.len(), 1, "overlapping requests have no event identity and must be refused");
+            assert!(h.state().0.toast.as_ref().is_some_and(|(text, _)| text.contains("Click in the document")));
+            h.run_steps(6);
+            if change == 1 {
+                let caret = h.state().0.editor.as_ref().unwrap().caret;
+                h.state_mut().0.editor.as_mut().unwrap().caret = 0;
+                h.run_steps(2);
+                h.state_mut().0.editor.as_mut().unwrap().caret = caret;
+                h.run_steps(2);
+            }
+            if change == 2 {
+                let selection = h.state().0.session.active().unwrap().selection.clone();
+                h.state_mut().0.session.active_mut().unwrap().selection.active.row += 1;
+                h.run_steps(2);
+                h.state_mut().0.session.active_mut().unwrap().selection = selection;
+                h.run_steps(2);
+            }
+            assert_eq!(document(&h.state().0), doc);
+            if change == 4 || change == 5 {
+                h.event(if change == 4 {
+                    egui::Event::Text("synthetic edit".into())
+                } else {
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        source: egui::MouseWheelSource::Unknown,
+                        delta: egui::vec2(0.0, 8.0),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    }
+                });
+                h.run_steps(2);
+                assert_eq!(h.state().0.desktop_clipboard.len(), 1, "Text and wheel cannot retire a native regular paste");
+            }
+            let event = if image {
+                egui::Event::PasteImage(std::sync::Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE])))
+            } else {
+                egui::Event::Paste("delayed".into())
+            };
+            if change == 3 {
+                // Selection has not changed in the model yet; the editor would process this
+                // key later in the same UI pass as the queued paste.
+                h.event(egui::Event::Key {
+                    key: egui::Key::ArrowRight,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            h.event(event);
+            h.run_steps(2);
+            assert_eq!(h.state().1.len(), usize::from(change == 0), "a selection change remains rejected after returning to the original caret");
+            assert!(h.state().0.desktop_clipboard.is_empty());
+            h.event(egui::Event::Paste("keyboard".into()));
+            h.run_steps(2);
+            assert_eq!(h.state().1.len(), usize::from(change == 0) + 1, "the resolved guard must not block later keyboard paste");
+        }
+    }
+
+    #[test]
+    fn desktop_menu_native_cancellation_filters_delivery_but_synthetic_carriers_keep_identity() {
+        for synthetic in [false, true] {
+            let mut app = app();
+            let ctx = egui::Context::default();
+            app.begin_edit(Some("draft".into()), false);
+            let doc = document(&app);
+            activate(&mut app, &ctx, doc, &Action { command: "edit.paste".into(), params: json!({}) });
+            app.synthetic_pending = synthetic;
+            let mut raw = egui::RawInput {
+                events: vec![
+                    egui::Event::Paste("queued response".into()),
+                    egui::Event::PointerButton {
+                        pos: egui::Pos2::ZERO,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            };
+            guard_native_clipboard(&mut app, &mut raw);
+            assert_eq!(app.desktop_clipboard.len(), usize::from(synthetic));
+            assert_eq!(raw.events.iter().any(|e| matches!(e, egui::Event::Paste(_))), synthetic);
         }
     }
 }
